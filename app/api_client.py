@@ -25,23 +25,16 @@ def _headers() -> dict:
 
 
 def register_server(server_url: str) -> bool:
-    """Tell Laravel that this CLAM server is online."""
-    payload = {
-        "server_id": LARAVEL_SERVER_ID,
-        "server_url": server_url,
-        "status": "online",
-        "service": "clam_training",
-        "port": 8002,
-    }
+    """Tell Laravel that this CLAM server is online (same pattern as TITAN/Virchow2)."""
     try:
         with httpx.Client(timeout=_TIMEOUT) as client:
             resp = client.post(
-                f"{LARAVEL_BASE_URL}/api/v1/servers/register",
-                json=payload,
+                f"{LARAVEL_BASE_URL}/api/v1/servers/{LARAVEL_SERVER_ID}/update-url",
+                json={"api_url": server_url},
                 headers=_headers(),
             )
             resp.raise_for_status()
-            logger.info("Registered with Laravel: %s", resp.json())
+            logger.info("Self-registered api_url=%s on Laravel (server_id=%d)", server_url, LARAVEL_SERVER_ID)
             return True
     except Exception as exc:
         logger.warning("Could not register with Laravel: %s", exc)
