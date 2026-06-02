@@ -257,6 +257,11 @@ class ClamTrainer:
         sample_data: list[dict],
         run_id: int,
         progress_callback=None,
+        # Explicit splits provided by Laravel (preferred).
+        # If None, a random 80/20 train/val split is applied as fallback.
+        train_data: Optional[list[dict]] = None,
+        val_data:   Optional[list[dict]] = None,
+        test_data:  Optional[list[dict]] = None,
     ):
         self.cfg = cfg
         self.run_id = run_id
@@ -271,12 +276,26 @@ class ClamTrainer:
         )
         logger.info("CLAM trainer: device=%s  run_id=%s", self.device, run_id)
 
-        # 80/20 split
-        n = len(sample_data)
-        train_n = max(1, int(n * 0.8))
-        random.shuffle(sample_data)
-        self.train_data = sample_data[:train_n]
-        self.val_data = sample_data[train_n:]
+        if train_data is not None:
+            # ── Explicit split from caller ─────────────────────────────────────
+            self.train_data = train_data
+            self.val_data   = val_data or []
+            self.test_data  = test_data or []
+            logger.info(
+                "Using explicit split — train=%d  val=%d  test=%d",
+                len(self.train_data), len(self.val_data), len(self.test_data),
+            )
+        else:
+            # ── Fallback: random 80/20 train/val split (no test set) ──────────
+            logger.warning(
+                "No explicit split provided for run_id=%d — applying random 80/20 split", run_id
+            )
+            n = len(sample_data)
+            train_n = max(1, int(n * 0.8))
+            random.shuffle(sample_data)
+            self.train_data = sample_data[:train_n]
+            self.val_data   = sample_data[train_n:]
+            self.test_data  = []
 
         self.model = build_model(cfg).to(self.device)
         self.optimizer = Adam(
@@ -327,6 +346,22 @@ class ClamTrainer:
             if self.progress_callback:
                 self.progress_callback(self.run_id, epoch, self.cfg.epochs, epoch_metrics)
 
+        # ── Final test-set evaluation using best checkpoint ──────────────────
+        test_metrics: dict = {}
+        if self.test_data:
+            logger.info("Loading best checkpoint for test-set evaluation …")
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            test_metrics = self._run_epoch(self.test_data, train=False)
+            test_metrics = {
+                "test_loss": round(test_metrics["loss"], 4),
+                "test_acc":  round(test_metrics["acc"],  4),
+                "test_auc":  round(test_metrics.get("auc", 0.0), 4),
+            }
+            logger.info("Test-set results: %s", test_metrics)
+        else:
+            logger.info("No test set provided — skipping final test evaluation.")
+
         final_metrics = {
             "best_val_auc": round(best_val_auc, 4),
             "best_epoch": best_epoch,
@@ -334,6 +369,8 @@ class ClamTrainer:
             "total_epochs": self.cfg.epochs,
             "n_train": len(self.train_data),
             "n_val": len(self.val_data),
+            "n_test": len(self.test_data),
+            **test_metrics,   # test_loss / test_acc / test_auc (if test set exists)
         }
         return ckpt_path, final_metrics
 

@@ -60,12 +60,18 @@ class SamplePayload(BaseModel):
     sample_id: int
     label: int
     gdrive_features_path: str
+    training_phase: int = 1  # 1=train  2=val  3=test
 
 
 class TrainingStartRequest(BaseModel):
     run_id: int
     feature_model: str = "TITAN"
-    samples: list[SamplePayload]
+    # ── Preferred: explicit three-way split ───────────────────────────────────
+    samples_train: list[SamplePayload] = []
+    samples_val:   list[SamplePayload] = []
+    samples_test:  list[SamplePayload] = []
+    # ── Legacy: flat list (used when split was not specified; server splits randomly) ─
+    samples: list[SamplePayload] = []
     training_params: dict[str, Any] = {}
     gdrive_output_dir: str = ""
 
@@ -110,6 +116,11 @@ def start_training(req: TrainingStartRequest):
     job_payload = {
         "run_id": run_id,
         "feature_model": req.feature_model,
+        # Explicit three-way split (empty lists fall back to random split in main.py)
+        "samples_train": [s.model_dump() for s in req.samples_train],
+        "samples_val":   [s.model_dump() for s in req.samples_val],
+        "samples_test":  [s.model_dump() for s in req.samples_test],
+        # Legacy flat list
         "samples": [s.model_dump() for s in req.samples],
         "training_params": req.training_params,
         "gdrive_output_dir": req.gdrive_output_dir or f"training/CLAM/run_{run_id}",

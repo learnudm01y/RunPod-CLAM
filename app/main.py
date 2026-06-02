@@ -30,63 +30,92 @@ def run_training_job(job: dict[str, Any]) -> None:
     {
         "run_id": int,
         "feature_model": str,            # e.g. "TITAN" or "Virchow2"
-        "samples": [
-            {
-                "sample_id": int,
-                "label": int,
-                "gdrive_features_path": str   # relative GDrive path to .h5 file
-            },
-            ...
-        ],
+        # Preferred: explicit three-way split from Laravel
+        "samples_train": [ {"sample_id": int, "label": int, "gdrive_features_path": str}, ... ],
+        "samples_val":   [ ... ],
+        "samples_test":  [ ... ],
+        # Legacy fallback: flat list (server splits 80/20 if samples_train is empty)
+        "samples": [ ... ],
         "training_params": { ... },       # fields of TrainingConfig
         "gdrive_output_dir": str,         # GDrive path to store checkpoint
     }
     """
     run_id: int = job["run_id"]
     feature_model: str = job.get("feature_model", "unknown")
-    samples_payload: list[dict] = job.get("samples", [])
     training_params: dict = job.get("training_params", {})
     gdrive_output_dir: str = job.get("gdrive_output_dir", f"training/CLAM/run_{run_id}")
 
-    logger.info(
-        "Starting training run_id=%d  feature_model=%s  n_samples=%d",
-        run_id, feature_model, len(samples_payload),
-    )
+    # ── Resolve split source ──────────────────────────────────────────────────
+    # Prefer explicit three-way split; fall back to legacy flat list
+    samples_train_raw: list[dict] = job.get("samples_train", [])
+    samples_val_raw:   list[dict] = job.get("samples_val",   [])
+    samples_test_raw:  list[dict] = job.get("samples_test",  [])
+    samples_flat_raw:  list[dict] = job.get("samples",       [])
+
+    use_explicit_split = bool(samples_train_raw)  # True when Laravel sent explicit split
+
+    if use_explicit_split:
+        all_samples_raw = samples_train_raw + samples_val_raw + samples_test_raw
+        logger.info(
+            "Starting training run_id=%d  feature_model=%s  explicit_split: "
+            "train=%d val=%d test=%d",
+            run_id, feature_model,
+            len(samples_train_raw), len(samples_val_raw), len(samples_test_raw),
+        )
+    else:
+        all_samples_raw = samples_flat_raw
+        logger.warning(
+            "Starting training run_id=%d  feature_model=%s  NO explicit split provided — "
+            "will fall back to random 80/20 train/val split  n_samples=%d",
+            run_id, feature_model, len(all_samples_raw),
+        )
 
     # ── 1. Download features ──────────────────────────────────────────────────
     local_features_dir = os.path.join(FEATURES_DIR, feature_model, f"run_{run_id}")
     os.makedirs(local_features_dir, exist_ok=True)
 
-    sample_data: list[dict] = []
-    n_failed = 0
-
-    for s in samples_payload:
-        gdrive_path = s.get("gdrive_features_path", "")
-        local_path = os.path.join(local_features_dir, os.path.basename(gdrive_path))
-
-        ok = True
-        if gdrive_path and not os.path.exists(local_path):
-            ok = sync_features_from_gdrive(gdrive_path, local_features_dir)
-
-        if ok and os.path.exists(local_path):
-            sample_data.append(
-                {
-                    "sample_id": s["sample_id"],
-                    "label": int(s["label"]),
+    def _resolve_samples(raw_list: list[dict]) -> tuple[list[dict], int]:
+        """Download features and return (resolved_sample_data, n_failed)."""
+        resolved = []
+        failed = 0
+        for s in raw_list:
+            gdrive_path = s.get("gdrive_features_path", "")
+            local_path = os.path.join(local_features_dir, os.path.basename(gdrive_path))
+            ok = True
+            if gdrive_path and not os.path.exists(local_path):
+                ok = sync_features_from_gdrive(gdrive_path, local_features_dir)
+            if ok and os.path.exists(local_path):
+                resolved.append({
+                    "sample_id":           s["sample_id"],
+                    "label":               int(s["label"]),
+                    "training_phase":      int(s.get("training_phase", 1)),
                     "features_local_path": local_path,
-                }
-            )
-        else:
-            logger.warning("Could not get features for sample_id=%s", s.get("sample_id"))
-            n_failed += 1
+                })
+            else:
+                logger.warning("Could not get features for sample_id=%s", s.get("sample_id"))
+                failed += 1
+        return resolved, failed
+
+    if use_explicit_split:
+        train_data, n_failed_train = _resolve_samples(samples_train_raw)
+        val_data,   n_failed_val   = _resolve_samples(samples_val_raw)
+        test_data,  n_failed_test  = _resolve_samples(samples_test_raw)
+        n_failed = n_failed_train + n_failed_val + n_failed_test
+        sample_data = train_data + val_data + test_data
+        logger.info(
+            "Features resolved — train=%d val=%d test=%d  failed=%d",
+            len(train_data), len(val_data), len(test_data), n_failed,
+        )
+    else:
+        sample_data, n_failed = _resolve_samples(all_samples_raw)
+        train_data, val_data, test_data = None, None, None  # ClamTrainer will random-split
+        logger.info("Loaded %d feature bags (%d failed)", len(sample_data), n_failed)
 
     if not sample_data:
         error_msg = f"No usable feature files found (all {n_failed} samples failed to download)"
         logger.error(error_msg)
         report_training_finished(run_id, {}, error=error_msg)
         return
-
-    logger.info("Loaded %d feature bags (%d failed)", len(sample_data), n_failed)
 
     # ── 2. Build config ───────────────────────────────────────────────────────
     # Auto-detect in_dim from first available feature file
@@ -108,7 +137,15 @@ def run_training_job(job: dict[str, Any]) -> None:
     def _progress(run_id_, epoch_, total_, metrics_):
         report_training_progress(run_id_, epoch_, total_, metrics_)
 
-    trainer = ClamTrainer(cfg, sample_data, run_id, progress_callback=_progress)
+    trainer = ClamTrainer(
+        cfg,
+        sample_data,
+        run_id,
+        progress_callback=_progress,
+        train_data=train_data,
+        val_data=val_data,
+        test_data=test_data,
+    )
     try:
         ckpt_path, final_metrics = trainer.train()
     except Exception as exc:
