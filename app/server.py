@@ -58,7 +58,10 @@ def _verify_api_key(authorization: str = Header(...)) -> None:
 
 class SamplePayload(BaseModel):
     sample_id: int
+    # Exactly one fine class index — the exact disease entity for this slide.
     label: int
+    # Its coarse family index for hierarchical runs; -1 = unknown / flat run.
+    parent_label: int = -1
     gdrive_features_path: str
     training_phase: int = 1  # 1=train  2=val  3=test
 
@@ -73,6 +76,10 @@ class TrainingStartRequest(BaseModel):
     # ── Legacy: flat list (used when split was not specified; server splits randomly) ─
     samples: list[SamplePayload] = []
     training_params: dict[str, Any] = {}
+    # Index-aligned human-readable class names — stored in the checkpoint so an
+    # inference run can name the disease it predicted.
+    label_map: list[str] = []
+    parent_label_map: list[str] = []
     gdrive_output_dir: str = ""
 
 
@@ -123,6 +130,8 @@ def start_training(req: TrainingStartRequest):
         # Legacy flat list
         "samples": [s.model_dump() for s in req.samples],
         "training_params": req.training_params,
+        "label_map": req.label_map,
+        "parent_label_map": req.parent_label_map,
         "gdrive_output_dir": req.gdrive_output_dir or f"training/CLAM/run_{run_id}",
     }
 

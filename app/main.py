@@ -3,7 +3,7 @@ Main training pipeline — called by the FastAPI server to run a CLAM training j
 
 Workflow:
   1. Download feature HDF5 files from Google Drive (via rclone)
-  2. Build BagDataset from sample list + labels
+  2. Resolve the sample list + labels (fine, and coarse when hierarchical)
   3. Run ClamTrainer
   4. Upload best checkpoint to Google Drive
   5. Return metrics
@@ -31,19 +31,28 @@ def run_training_job(job: dict[str, Any]) -> None:
         "run_id": int,
         "feature_model": str,            # e.g. "TITAN" or "Virchow2"
         # Preferred: explicit three-way split from Laravel
-        "samples_train": [ {"sample_id": int, "label": int, "gdrive_features_path": str}, ... ],
+        "samples_train": [
+            {"sample_id": int, "label": int, "parent_label": int, "gdrive_features_path": str}, ...
+        ],
         "samples_val":   [ ... ],
         "samples_test":  [ ... ],
         # Legacy fallback: flat list (server splits 80/20 if samples_train is empty)
         "samples": [ ... ],
         "training_params": { ... },       # fields of TrainingConfig
+        "label_map": [str, ...],          # fine class names, index-aligned
+        "parent_label_map": [str, ...],   # coarse class names (hierarchical runs)
         "gdrive_output_dir": str,         # GDrive path to store checkpoint
     }
+
+    `label` is always ONE fine class index (the exact disease entity).
+    `parent_label` is its coarse family index, or -1 / absent for flat runs.
     """
     run_id: int = job["run_id"]
     feature_model: str = job.get("feature_model", "unknown")
     training_params: dict = job.get("training_params", {})
     gdrive_output_dir: str = job.get("gdrive_output_dir", f"training/CLAM/run_{run_id}")
+    label_map: list = job.get("label_map", []) or []
+    parent_label_map: list = job.get("parent_label_map", []) or []
 
     # ── Resolve split source ──────────────────────────────────────────────────
     # Prefer explicit three-way split; fall back to legacy flat list
@@ -88,6 +97,7 @@ def run_training_job(job: dict[str, Any]) -> None:
                 resolved.append({
                     "sample_id":           s["sample_id"],
                     "label":               int(s["label"]),
+                    "parent_label":        int(s.get("parent_label", -1)),
                     "training_phase":      int(s.get("training_phase", 1)),
                     "features_local_path": local_path,
                 })
@@ -119,7 +129,6 @@ def run_training_job(job: dict[str, Any]) -> None:
 
     # ── 2. Build config ───────────────────────────────────────────────────────
     # Auto-detect in_dim from first available feature file
-    import torch
     first_h5 = sample_data[0]["features_local_path"]
     try:
         import h5py
@@ -130,7 +139,39 @@ def run_training_job(job: dict[str, Any]) -> None:
         in_dim = training_params.get("in_dim", 1024)
 
     cfg_dict = {**training_params, "in_dim": in_dim}
+
+    # Derive n_classes from the labels actually present when Laravel did not
+    # pin it — never train a head with fewer outputs than there are classes.
+    max_label = max(int(s["label"]) for s in sample_data)
+    if int(cfg_dict.get("n_classes", 0)) <= max_label:
+        logger.warning(
+            "n_classes=%s is too small for max label %d — raising to %d",
+            cfg_dict.get("n_classes"), max_label, max_label + 1,
+        )
+        cfg_dict["n_classes"] = max_label + 1
+
     cfg = TrainingConfig.from_dict(cfg_dict)
+
+    # ── Validate the hierarchy before it can silently misbehave ───────────────
+    if cfg.n_parent_classes > 1:
+        c2p = list(cfg.child_to_parent or [])
+        if len(c2p) != cfg.n_classes:
+            logger.error(
+                "child_to_parent has %d entries but n_classes=%d — disabling hierarchical "
+                "supervision for this run.", len(c2p), cfg.n_classes,
+            )
+            cfg.n_parent_classes = 0
+            cfg.child_to_parent = []
+            cfg.hier_weight = 0.0
+        elif any(p >= cfg.n_parent_classes for p in c2p):
+            logger.error(
+                "child_to_parent references a parent index >= n_parent_classes=%d — "
+                "disabling hierarchical supervision for this run.", cfg.n_parent_classes,
+            )
+            cfg.n_parent_classes = 0
+            cfg.child_to_parent = []
+            cfg.hier_weight = 0.0
+
     logger.info("TrainingConfig: %s", cfg.__dict__)
 
     # ── 3. Train ──────────────────────────────────────────────────────────────
@@ -145,6 +186,8 @@ def run_training_job(job: dict[str, Any]) -> None:
         train_data=train_data,
         val_data=val_data,
         test_data=test_data,
+        label_map=label_map,
+        parent_label_map=parent_label_map,
     )
     try:
         ckpt_path, final_metrics = trainer.train()
@@ -163,4 +206,11 @@ def run_training_job(job: dict[str, Any]) -> None:
 
     # ── 5. Report success ─────────────────────────────────────────────────────
     report_training_finished(run_id, final_metrics, model_path=model_gdrive_path)
-    logger.info("Training run_id=%d finished. Best AUC=%.4f", run_id, final_metrics.get("best_val_auc", 0))
+    logger.info(
+        "Training run_id=%d finished. best %s=%.4f (epoch %s) — balanced_acc=%.4f",
+        run_id,
+        final_metrics.get("monitor", "macro_auc"),
+        final_metrics.get("best_monitor_value", 0.0),
+        final_metrics.get("best_epoch", 0),
+        final_metrics.get("best_val_balanced_acc", 0.0),
+    )
